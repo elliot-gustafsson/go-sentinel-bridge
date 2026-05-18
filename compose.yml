@@ -1,0 +1,76 @@
+version: '3.8'
+services:
+  # -------------------------
+  # Valkey Data Nodes (3 Nodes: 1 Master, 2 Replicas)
+  # -------------------------
+  valkey-master:
+    image: docker.io/valkey/valkey:9.0.3
+    container_name: valkey-master
+    command: valkey-server
+  valkey-replica-1:
+    image: docker.io/valkey/valkey:9.0.3
+    container_name: valkey-replica-1
+    command: valkey-server --replicaof valkey-master 6379
+    depends_on:
+      - valkey-master
+  valkey-replica-2:
+    image: docker.io/valkey/valkey:9.0.3
+    container_name: valkey-replica-2
+    command: valkey-server --replicaof valkey-master 6379
+    depends_on:
+      - valkey-master
+  # -------------------------
+  # Valkey Sentinels (3 Sentinels, Quorum: 2)
+  # -------------------------
+  valkey-sentinel-1:
+    image: docker.io/valkey/valkey:9.0.3
+    container_name: valkey-sentinel-1
+    command: >
+      sh -c "echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+             echo 'sentinel announce-hostnames yes' >> /tmp/sentinel.conf &&
+             echo 'sentinel monitor mymaster valkey-master 6379 2' >> /tmp/sentinel.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 3000' >> /tmp/sentinel.conf &&
+             echo 'sentinel failover-timeout mymaster 3000' >> /tmp/sentinel.conf &&
+             valkey-server /tmp/sentinel.conf --sentinel"
+    depends_on:
+      - valkey-master
+  valkey-sentinel-2:
+    image: docker.io/valkey/valkey:9.0.3
+    container_name: valkey-sentinel-2
+    command: >
+      sh -c "echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+             echo 'sentinel announce-hostnames yes' >> /tmp/sentinel.conf &&
+             echo 'sentinel monitor mymaster valkey-master 6379 2' >> /tmp/sentinel.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 3000' >> /tmp/sentinel.conf &&
+             echo 'sentinel failover-timeout mymaster 3000' >> /tmp/sentinel.conf &&
+             valkey-server /tmp/sentinel.conf --sentinel"
+    depends_on:
+      - valkey-master
+  valkey-sentinel-3:
+    image: docker.io/valkey/valkey:9.0.3
+    container_name: valkey-sentinel-3
+    command: >
+      sh -c "echo 'sentinel resolve-hostnames yes' > /tmp/sentinel.conf &&
+             echo 'sentinel announce-hostnames yes' >> /tmp/sentinel.conf &&
+             echo 'sentinel monitor mymaster valkey-master 6379 2' >> /tmp/sentinel.conf &&
+             echo 'sentinel down-after-milliseconds mymaster 3000' >> /tmp/sentinel.conf &&
+             echo 'sentinel failover-timeout mymaster 3000' >> /tmp/sentinel.conf &&
+             valkey-server /tmp/sentinel.conf --sentinel"
+    depends_on:
+      - valkey-master
+
+  sentinel-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel-bridge
+    environment:
+      - PROXY_BIND_ADDR=0.0.0.0:8080
+      - MASTER_NAME=mymaster
+      - SENTINEL_ADDRS=valkey-sentinel-1:26379,valkey-sentinel-2:26379,valkey-sentinel-3:26379
+    ports:
+      - "8080:8080"
+    depends_on:
+      - valkey-sentinel-1
+      - valkey-sentinel-2
+      - valkey-sentinel-3
