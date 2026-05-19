@@ -105,6 +105,17 @@ func main() {
 		bindAddr = "0.0.0.0:6379"
 	}
 
+	backendDialer := &net.Dialer{Timeout: 3 * time.Second}
+	dialTimeout := os.Getenv("BACKEND_DIAL_TIMEOUT")
+	if dialTimeout != "" {
+		d, err := time.ParseDuration(dialTimeout)
+		if err != nil {
+			slog.Error("error parsing BACKEND_DIAL_TIMEOUT", "error", err.Error())
+			os.Exit(1)
+		}
+		backendDialer.Timeout = d
+	}
+
 	masterName := os.Getenv("MASTER_NAME")
 	if masterName == "" {
 		slog.Error("MASTER_NAME environment variable is missing")
@@ -117,34 +128,46 @@ func main() {
 		os.Exit(1)
 	}
 
-	backendDialer := &net.Dialer{Timeout: 3 * time.Second}
-	dialTimeout := os.Getenv("BACKEND_DIAL_TIMEOUT")
-	if dialTimeout != "" {
-		d, err := time.ParseDuration(dialTimeout)
-		if err != nil {
-			slog.Error("error parsing BACKEND_DIAL_TIMEOUT", "error", err.Error())
-			os.Exit(1)
-		}
-		backendDialer.Timeout = d
-	}
-
 	var sentinels []valkey.Client
+	var expectedSentinels int
 	for s := range strings.SplitSeq(sentinelAddrs, ",") {
-		client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{strings.TrimSpace(s)}})
+		expectedSentinels++
+		addr := strings.TrimSpace(s)
+
+		client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}})
 		if err != nil {
-			slog.Error("error creating sentinel client", "error", err.Error())
-			os.Exit(1)
+			slog.Warn("failed to connect to sentinel", "sentinel_addr", addr, "error", err.Error())
+			continue
 		}
 		defer client.Close()
 		sentinels = append(sentinels, client)
 	}
 
-	if len(sentinels) == 0 {
+	if expectedSentinels == 0 {
 		slog.Error("SENTINEL_ADDRS contains no valid endpoints")
 		os.Exit(1)
 	}
 
-	quorumSize := (len(sentinels) / 2) + 1
+	quorumSize := (expectedSentinels / 2) + 1
+
+	if len(sentinels) < quorumSize {
+		slog.Error("not enough sentinels available to reach quorum",
+			"available", len(sentinels),
+			"required_quorum", quorumSize,
+			"expected_total", expectedSentinels,
+		)
+		os.Exit(1)
+	}
+
+	reconcileInterval := 10 * time.Second
+	if v := os.Getenv("RECONCILE_INTERVAL"); v != "" {
+		i, err := time.ParseDuration(v)
+		if err != nil {
+			slog.Error("error parsing RECONCILE_INTERVAL", "error", err.Error())
+			os.Exit(1)
+		}
+		reconcileInterval = i
+	}
 
 	slog.Info("starting proxy",
 		"bind_addr", bindAddr,
@@ -160,7 +183,7 @@ func main() {
 	signalCtx, signalCtxStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGQUIT, syscall.SIGTERM)
 	defer signalCtxStop()
 
-	verifiedMaster, err := bootstrapQuorumMaster(signalCtx, sentinels, masterName, quorumSize)
+	verifiedMaster, err := resolveMasterByQuorum(signalCtx, sentinels, masterName, quorumSize)
 	if err != nil {
 		slog.Error("error running bootstrap", "error", err.Error())
 		os.Exit(1)
@@ -182,6 +205,8 @@ func main() {
 		go runSentinelSubscriber(ctx, i, s, masterName, eventChan)
 	}
 	go runQuorumCoordinator(ctx, quorumSize, eventChan, &statePointer)
+
+	go runReconciliationLoop(ctx, sentinels, masterName, quorumSize, eventChan, &statePointer, reconcileInterval)
 
 	listener, err := net.Listen("tcp", bindAddr)
 	if err != nil {
@@ -315,7 +340,7 @@ func handleClientConnection(
 	}
 }
 
-func bootstrapQuorumMaster(ctx context.Context, sentinels []valkey.Client, masterName string, quorumSize int) (string, error) {
+func resolveMasterByQuorum(ctx context.Context, sentinels []valkey.Client, masterName string, quorumSize int) (string, error) {
 	for {
 
 		if ctx.Err() != nil {
@@ -327,7 +352,7 @@ func bootstrapQuorumMaster(ctx context.Context, sentinels []valkey.Client, maste
 
 		for i, s := range sentinels {
 			wg.Go(func() {
-				addr, err := bootstrapSingleMaster(ctx, s, masterName)
+				addr, err := querySentinelForMaster(ctx, s, masterName)
 				if err != nil {
 					slog.Error("error getting master address", "sentinel", i, "error", err.Error())
 					return
@@ -354,12 +379,12 @@ func bootstrapQuorumMaster(ctx context.Context, sentinels []valkey.Client, maste
 	}
 }
 
-func bootstrapSingleMaster(ctx context.Context, sentinel valkey.Client, masterName string) (string, error) {
-
-	slog.Info("querying sentinel")
+func querySentinelForMaster(ctx context.Context, sentinel valkey.Client, masterName string) (string, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 
 	cmd := sentinel.B().Arbitrary("SENTINEL", "get-master-addr-by-name", masterName).Build()
-	res, err := sentinel.Do(ctx, cmd).AsStrSlice()
+	res, err := sentinel.Do(queryCtx, cmd).AsStrSlice()
 	if err != nil {
 		return "", err
 	}
@@ -435,4 +460,48 @@ func runSentinelSubscriber(ctx context.Context, id int, sentinel valkey.Client, 
 		time.Sleep(2 * time.Second)
 	}
 
+}
+
+func runReconciliationLoop(
+	ctx context.Context,
+	sentinels []valkey.Client,
+	masterName string,
+	quorumSize int,
+	eventChan chan<- SwitchMasterEvent,
+	statePointer *atomic.Pointer[ProxyState],
+	interval time.Duration,
+) {
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			currentQuorumMaster, err := resolveMasterByQuorum(ctx, sentinels, masterName, quorumSize)
+			if err != nil {
+				slog.Info("background master reconciliation failed to reach quorum", "error", err)
+				continue
+			}
+			currentState := statePointer.Load()
+			if currentState != nil && currentState.addr != currentQuorumMaster {
+				slog.Warn("background poller detected master drift (missed pub/sub event)",
+					"current_proxy_target", currentState.addr,
+					"actual_quorum_master", currentQuorumMaster,
+				)
+
+				for i := range sentinels {
+					select {
+					case eventChan <- SwitchMasterEvent{
+						sentinelId: i,
+						newAddr:    currentQuorumMaster,
+					}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}
 }
