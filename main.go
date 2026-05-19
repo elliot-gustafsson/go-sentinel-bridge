@@ -256,7 +256,12 @@ func handleClientConnection(
 		slog.Error("failed to connect to backend", "master_addr", masterAddr, "error", err)
 		return
 	}
-	defer backendStream.Close()
+
+	closeConns := func() {
+		clientStream.Close()
+		backendStream.Close()
+	}
+	defer closeConns()
 
 	if tcpConn, ok := clientStream.(*net.TCPConn); ok {
 		tcpConn.SetNoDelay(true)
@@ -265,33 +270,32 @@ func handleClientConnection(
 		tcpConn.SetNoDelay(true)
 	}
 
-	errChan := make(chan error, 2)
+	stopStateWatch := context.AfterFunc(currentState.ctx, closeConns)
+	defer stopStateWatch()
 
-	// client -> backend
-	go func() {
-		buf := bufferPool.Get().(*[]byte)
-		defer bufferPool.Put(buf)
-		_, err := io.CopyBuffer(backendStream, clientStream, *buf)
-		errChan <- err
-	}()
+	stopShutdownWatch := context.AfterFunc(shutdownCtx, closeConns)
+	defer stopShutdownWatch()
 
 	// backend -> client
 	go func() {
 		buf := bufferPool.Get().(*[]byte)
 		defer bufferPool.Put(buf)
-		_, err := io.CopyBuffer(clientStream, backendStream, *buf)
-		errChan <- err
+		_, _ = io.CopyBuffer(clientStream, backendStream, *buf)
+
+		closeConns()
 	}()
 
-	select {
-	case <-errChan:
-		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "client_disconnect").Inc()
+	// client -> backend
+	buf := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(buf)
+	_, _ = io.CopyBuffer(backendStream, clientStream, *buf)
 
-	case <-currentState.ctx.Done():
-		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "failover_severed").Inc()
-
-	case <-shutdownCtx.Done():
+	if shutdownCtx.Err() != nil {
 		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "graceful_shutdown").Inc()
+	} else if currentState.ctx.Err() != nil {
+		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "failover_severed").Inc()
+	} else {
+		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "client_disconnect").Inc()
 	}
 }
 
