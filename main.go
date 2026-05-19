@@ -44,22 +44,42 @@ var (
 	}, []string{"backend"})
 )
 
-var bufferPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 32*1024) // 32KB buffer
-		return &b
-	},
-}
-
 type SwitchMasterEvent struct {
 	sentinelId int
 	newAddr    string
 }
 
+type ProxyMetrics struct {
+	connectionsTotal        prometheus.Counter
+	activeConnections       prometheus.Gauge
+	backendConnectionErrors prometheus.Counter
+	closedGraceful          prometheus.Counter
+	closedSevered           prometheus.Counter
+	closedClientDisconnect  prometheus.Counter
+}
+
 type ProxyState struct {
-	addr   string
-	ctx    context.Context
-	cancel context.CancelFunc
+	addr    string
+	ctx     context.Context
+	cancel  context.CancelFunc
+	metrics ProxyMetrics
+}
+
+func NewProxyState(addr string) *ProxyState {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &ProxyState{
+		addr:   addr,
+		ctx:    ctx,
+		cancel: cancel,
+		metrics: ProxyMetrics{
+			connectionsTotal:        proxyConnectionsTotal.WithLabelValues(addr),
+			activeConnections:       proxyActiveConnections.WithLabelValues(addr),
+			backendConnectionErrors: proxyBackendConnectionErrorsTotal.WithLabelValues(addr),
+			closedGraceful:          proxyConnectionsClosedTotal.WithLabelValues(addr, "graceful_shutdown"),
+			closedSevered:           proxyConnectionsClosedTotal.WithLabelValues(addr, "failover_severed"),
+			closedClientDisconnect:  proxyConnectionsClosedTotal.WithLabelValues(addr, "client_disconnect"),
+		},
+	}
 }
 
 func main() {
@@ -95,6 +115,17 @@ func main() {
 	if sentinelAddrs == "" {
 		slog.Error("SENTINEL_ADDRS environment variable is missing")
 		os.Exit(1)
+	}
+
+	backendDialer := &net.Dialer{Timeout: 3 * time.Second}
+	dialTimeout := os.Getenv("BACKEND_DIAL_TIMEOUT")
+	if dialTimeout != "" {
+		d, err := time.ParseDuration(dialTimeout)
+		if err != nil {
+			slog.Error("error parsing BACKEND_DIAL_TIMEOUT", "error", err.Error())
+			os.Exit(1)
+		}
+		backendDialer.Timeout = d
 	}
 
 	var sentinels []valkey.Client
@@ -142,14 +173,10 @@ func main() {
 	eventChan := make(chan SwitchMasterEvent, 100)
 
 	var statePointer atomic.Pointer[ProxyState]
-	initialCtx, initialCancel := context.WithCancel(context.Background())
-	statePointer.Store(&ProxyState{
-		addr:   verifiedMaster,
-		ctx:    initialCtx,
-		cancel: initialCancel,
-	})
+	statePointer.Store(NewProxyState(verifiedMaster))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	for i, s := range sentinels {
 		go runSentinelSubscriber(ctx, i, s, masterName, eventChan)
@@ -170,19 +197,16 @@ func main() {
 	for {
 		clientStream, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				break
-			default:
-				slog.Error("failed to accept connection", "error", err)
-				continue
 			}
-			break
+			slog.Error("failed to accept connection", "error", err)
+			continue
 		}
 
 		activeConnectionsWG.Go(func() {
 			defer clientStream.Close()
-			handleClientConnection(ctx, clientStream, &statePointer)
+			handleClientConnection(ctx, backendDialer, clientStream, &statePointer)
 		})
 	}
 
@@ -229,12 +253,13 @@ func waitForShutdown(signalCtx context.Context, ctxCancel func(), ready *atomic.
 
 	slog.Info("starting shutdown...")
 
-	listener.Close()
 	ctxCancel()
+	listener.Close()
 }
 
 func handleClientConnection(
 	shutdownCtx context.Context,
+	dialer *net.Dialer,
 	clientStream net.Conn,
 	statePointer *atomic.Pointer[ProxyState],
 ) {
@@ -246,11 +271,12 @@ func handleClientConnection(
 	}
 	masterAddr := currentState.addr
 
-	proxyConnectionsTotal.WithLabelValues(masterAddr).Inc()
-	proxyActiveConnections.WithLabelValues(masterAddr).Inc()
-	defer proxyActiveConnections.WithLabelValues(masterAddr).Dec()
+	metrics := currentState.metrics
+	metrics.connectionsTotal.Inc()
+	metrics.activeConnections.Inc()
+	defer metrics.activeConnections.Dec()
 
-	backendStream, err := net.DialTimeout("tcp", masterAddr, 3*time.Second)
+	backendStream, err := dialer.DialContext(shutdownCtx, "tcp", masterAddr)
 	if err != nil {
 		proxyBackendConnectionErrorsTotal.WithLabelValues(masterAddr).Inc()
 		slog.Error("failed to connect to backend", "master_addr", masterAddr, "error", err)
@@ -263,39 +289,29 @@ func handleClientConnection(
 	}
 	defer closeConns()
 
-	if tcpConn, ok := clientStream.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
-	if tcpConn, ok := backendStream.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-	}
-
 	stopStateWatch := context.AfterFunc(currentState.ctx, closeConns)
 	defer stopStateWatch()
 
 	stopShutdownWatch := context.AfterFunc(shutdownCtx, closeConns)
 	defer stopShutdownWatch()
 
+	// NOTE: not using io.CopyBuffer due to *net.TCPConn implementing io.ReaderFrom, the buffer would just be unnecessary overhead
+
 	// backend -> client
 	go func() {
-		buf := bufferPool.Get().(*[]byte)
-		defer bufferPool.Put(buf)
-		_, _ = io.CopyBuffer(clientStream, backendStream, *buf)
-
+		_, _ = io.Copy(clientStream, backendStream)
 		closeConns()
 	}()
 
 	// client -> backend
-	buf := bufferPool.Get().(*[]byte)
-	defer bufferPool.Put(buf)
-	_, _ = io.CopyBuffer(backendStream, clientStream, *buf)
+	_, _ = io.Copy(backendStream, clientStream)
 
 	if shutdownCtx.Err() != nil {
-		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "graceful_shutdown").Inc()
+		metrics.closedGraceful.Inc()
 	} else if currentState.ctx.Err() != nil {
-		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "failover_severed").Inc()
+		metrics.closedSevered.Inc()
 	} else {
-		proxyConnectionsClosedTotal.WithLabelValues(masterAddr, "client_disconnect").Inc()
+		metrics.closedClientDisconnect.Inc()
 	}
 }
 
@@ -377,14 +393,9 @@ func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan 
 					"old_master", currentState.addr,
 				)
 
-				newCtx, newCancel := context.WithCancel(context.Background())
-				newState := &ProxyState{
-					addr:   event.newAddr,
-					ctx:    newCtx,
-					cancel: newCancel,
-				}
-
+				newState := NewProxyState(event.newAddr)
 				statePointer.Store(newState)
+
 				currentState.cancel()
 
 				masterVotes = make(map[string]map[int]bool)
