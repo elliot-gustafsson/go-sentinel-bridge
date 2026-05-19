@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -304,12 +305,14 @@ func bootstrapQuorumMaster(ctx context.Context, sentinels []valkey.Client, maste
 		results := make(chan string, len(sentinels))
 		var wg sync.WaitGroup
 
-		for _, s := range sentinels {
+		for i, s := range sentinels {
 			wg.Go(func() {
 				addr, err := bootstrapSingleMaster(ctx, s, masterName)
-				if err == nil {
-					results <- addr
+				if err != nil {
+					slog.Error("error getting master address", "sentinel", i, "error", err.Error())
+					return
 				}
+				results <- addr
 			})
 		}
 
@@ -344,7 +347,7 @@ func bootstrapSingleMaster(ctx context.Context, sentinel valkey.Client, masterNa
 	if len(res) == 2 {
 		return net.JoinHostPort(res[0], res[1]), nil
 	}
-	return "", errors.New("invalid response format")
+	return "", fmt.Errorf("invalid response format: %s", res)
 }
 
 func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan SwitchMasterEvent, statePointer *atomic.Pointer[ProxyState]) {
