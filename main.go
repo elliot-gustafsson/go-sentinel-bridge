@@ -56,6 +56,7 @@ type ProxyMetrics struct {
 	closedGraceful          prometheus.Counter
 	closedSevered           prometheus.Counter
 	closedClientDisconnect  prometheus.Counter
+	closedServerDisconnect  prometheus.Counter
 }
 
 type ProxyState struct {
@@ -78,6 +79,7 @@ func NewProxyState(addr string) *ProxyState {
 			closedGraceful:          proxyConnectionsClosedTotal.WithLabelValues(addr, "graceful_shutdown"),
 			closedSevered:           proxyConnectionsClosedTotal.WithLabelValues(addr, "failover_severed"),
 			closedClientDisconnect:  proxyConnectionsClosedTotal.WithLabelValues(addr, "client_disconnect"),
+			closedServerDisconnect:  proxyConnectionsClosedTotal.WithLabelValues(addr, "server_disconnect"),
 		},
 	}
 }
@@ -116,6 +118,26 @@ func main() {
 		backendDialer.Timeout = d
 	}
 
+	terminationGracePeriod := 5 * time.Second
+	if v := os.Getenv("TERMINATION_GRACE_PERIOD"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			slog.Error("error parsing TERMINATION_GRACE_PERIOD", "error", err.Error())
+			os.Exit(1)
+		}
+		terminationGracePeriod = d
+	}
+
+	connectionDrainTimeout := 30 * time.Second
+	if v := os.Getenv("CONNECTION_DRAIN_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			slog.Error("error parsing CONNECTION_DRAIN_TIMEOUT", "error", err.Error())
+			os.Exit(1)
+		}
+		connectionDrainTimeout = d
+	}
+
 	masterName := os.Getenv("MASTER_NAME")
 	if masterName == "" {
 		slog.Error("MASTER_NAME environment variable is missing")
@@ -131,8 +153,11 @@ func main() {
 	var sentinels []valkey.Client
 	var expectedSentinels int
 	for s := range strings.SplitSeq(sentinelAddrs, ",") {
-		expectedSentinels++
 		addr := strings.TrimSpace(s)
+		if addr == "" {
+			continue
+		}
+		expectedSentinels++
 
 		client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}})
 		if err != nil {
@@ -169,6 +194,20 @@ func main() {
 		reconcileInterval = i
 	}
 
+	httpListener, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		slog.Error("failed to bind listener", "addr", httpAddr, "error", err)
+		os.Exit(1)
+	}
+	slog.Info("http server listening on " + httpAddr)
+
+	proxyListener, err := net.Listen("tcp", bindAddr)
+	if err != nil {
+		slog.Error("failed to bind listener", "addr", bindAddr, "error", err)
+		os.Exit(1)
+	}
+	slog.Info("proxy listening on " + bindAddr)
+
 	slog.Info("starting proxy",
 		"bind_addr", bindAddr,
 		"master_name", masterName,
@@ -178,7 +217,7 @@ func main() {
 
 	var ready atomic.Bool
 
-	go runHttpServer(httpAddr, &ready)
+	go runHttpServer(httpListener, &ready)
 
 	signalCtx, signalCtxStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGQUIT, syscall.SIGTERM)
 	defer signalCtxStop()
@@ -208,21 +247,14 @@ func main() {
 
 	go runReconciliationLoop(ctx, sentinels, masterName, quorumSize, eventChan, &statePointer, reconcileInterval)
 
-	listener, err := net.Listen("tcp", bindAddr)
-	if err != nil {
-		slog.Error("failed to bind tcp listener", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("proxy listening on " + bindAddr)
-
 	var activeConnectionsWG sync.WaitGroup
 
-	go waitForShutdown(signalCtx, cancel, &ready, listener)
+	go waitForShutdown(signalCtx, &ready, proxyListener, terminationGracePeriod)
 
 	for {
-		clientStream, err := listener.Accept()
+		clientStream, err := proxyListener.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				break
 			}
 			slog.Error("failed to accept connection", "error", err)
@@ -236,11 +268,21 @@ func main() {
 	}
 
 	slog.Info("waiting for active connections to drain...")
+
+	shutdownCtx, shutdownCtxCancel := context.WithTimeout(context.Background(), connectionDrainTimeout)
+	defer shutdownCtxCancel()
+
+	stopShutdownWatch := context.AfterFunc(shutdownCtx, func() {
+		slog.Warn("connection drain timeout reached, closing active connections...")
+		cancel()
+	})
+	defer stopShutdownWatch()
+
 	activeConnectionsWG.Wait()
 	slog.Info("shutting down, bye bye!")
 }
 
-func runHttpServer(addr string, ready *atomic.Bool) {
+func runHttpServer(listener net.Listener, ready *atomic.Bool) {
 	router := http.NewServeMux()
 
 	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -258,27 +300,24 @@ func runHttpServer(addr string, ready *atomic.Bool) {
 
 	router.Handle("/metrics", promhttp.Handler())
 
-	slog.Info("http server listening on " + addr)
-
-	err := http.ListenAndServe(addr, router)
+	err := http.Serve(listener, router)
 	if err != nil {
 		slog.Error("http server error", "error", err.Error())
 		return
 	}
 }
 
-func waitForShutdown(signalCtx context.Context, ctxCancel func(), ready *atomic.Bool, listener net.Listener) {
+func waitForShutdown(signalCtx context.Context, ready *atomic.Bool, listener net.Listener, gracePeriod time.Duration) {
 	<-signalCtx.Done()
 
 	slog.Info("received termination signal")
 	ready.Store(false)
 
-	slog.Info("sleeping for 5s...")
-	time.Sleep(5 * time.Second)
+	slog.Info("entering graceful shutdown delay", "period_ms", gracePeriod.Milliseconds())
+	time.Sleep(gracePeriod)
 
 	slog.Info("starting shutdown...")
 
-	ctxCancel()
 	listener.Close()
 }
 
@@ -301,9 +340,9 @@ func handleClientConnection(
 	metrics.activeConnections.Inc()
 	defer metrics.activeConnections.Dec()
 
-	backendStream, err := dialer.DialContext(shutdownCtx, "tcp", masterAddr)
+	backendStream, err := dialer.DialContext(currentState.ctx, "tcp", masterAddr)
 	if err != nil {
-		proxyBackendConnectionErrorsTotal.WithLabelValues(masterAddr).Inc()
+		currentState.metrics.backendConnectionErrors.Inc()
 		slog.Error("failed to connect to backend", "master_addr", masterAddr, "error", err)
 		return
 	}
@@ -323,20 +362,28 @@ func handleClientConnection(
 	// NOTE: not using io.CopyBuffer due to *net.TCPConn implementing io.ReaderFrom, the buffer would just be unnecessary overhead
 
 	// backend -> client
+	backendDone := make(chan struct{}, 1)
 	go func() {
 		_, _ = io.Copy(clientStream, backendStream)
+		backendDone <- struct{}{}
 		closeConns()
 	}()
 
 	// client -> backend
 	_, _ = io.Copy(backendStream, clientStream)
 
-	if shutdownCtx.Err() != nil {
+	switch {
+	case shutdownCtx.Err() != nil:
 		metrics.closedGraceful.Inc()
-	} else if currentState.ctx.Err() != nil {
+	case currentState.ctx.Err() != nil:
 		metrics.closedSevered.Inc()
-	} else {
-		metrics.closedClientDisconnect.Inc()
+	default:
+		select {
+		case <-backendDone:
+			metrics.closedServerDisconnect.Inc()
+		default:
+			metrics.closedClientDisconnect.Inc()
+		}
 	}
 }
 
@@ -406,9 +453,7 @@ func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan 
 		case event := <-eventChan:
 			currentState := statePointer.Load()
 
-			// If there is no active election (len == 0) AND this is a vote for
-			// the master we already have, throw it away.
-			// This drops late echoes and ignores background polling noise.
+			// drop late echoes and background polling noise
 			if len(sentinelVotes) == 0 && currentState != nil && currentState.addr == event.newAddr {
 				continue
 			}
@@ -440,9 +485,16 @@ func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan 
 }
 
 func runSentinelSubscriber(ctx context.Context, id int, sentinel valkey.Client, masterName string, eventChan chan<- SwitchMasterEvent) {
+	const defaultBackoff = 100 * time.Millisecond
+	const maxBackoff = 5 * time.Second
+
+	backoff := defaultBackoff
+
 	for {
 
 		sub := sentinel.B().Subscribe().Channel("+switch-master").Build()
+
+		startTime := time.Now()
 
 		err := sentinel.Receive(ctx, sub, func(msg valkey.PubSubMessage) {
 			if msg.Channel != "+switch-master" {
@@ -466,8 +518,21 @@ func runSentinelSubscriber(ctx context.Context, id int, sentinel valkey.Client, 
 			return
 		}
 
-		slog.Error("sentinel subscriber disconnected", "sentinel", id, "error", err.Error())
-		time.Sleep(2 * time.Second)
+		if time.Since(startTime) > maxBackoff {
+			backoff = defaultBackoff
+		}
+
+		slog.Error("sentinel subscriber disconnected",
+			"sentinel", id,
+			"error", err,
+			"reconnecting_in_ms", backoff.Milliseconds(),
+		)
+
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
 	}
 
 }
