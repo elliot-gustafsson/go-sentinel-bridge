@@ -396,7 +396,7 @@ func querySentinelForMaster(ctx context.Context, sentinel valkey.Client, masterN
 }
 
 func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan SwitchMasterEvent, statePointer *atomic.Pointer[ProxyState]) {
-	masterVotes := make(map[string]map[int]bool)
+	sentinelVotes := make(map[int]string)
 
 	for {
 
@@ -404,15 +404,25 @@ func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan 
 		case <-ctx.Done():
 			return
 		case event := <-eventChan:
-
-			if masterVotes[event.newAddr] == nil {
-				masterVotes[event.newAddr] = make(map[int]bool)
-			}
-			masterVotes[event.newAddr][event.sentinelId] = true
-
 			currentState := statePointer.Load()
 
-			if len(masterVotes[event.newAddr]) >= quorumSize && currentState.addr != event.newAddr {
+			// If there is no active election (len == 0) AND this is a vote for
+			// the master we already have, throw it away.
+			// This drops late echoes and ignores background polling noise.
+			if len(sentinelVotes) == 0 && currentState != nil && currentState.addr == event.newAddr {
+				continue
+			}
+
+			sentinelVotes[event.sentinelId] = event.newAddr
+
+			voteCount := 0
+			for _, addr := range sentinelVotes {
+				if addr == event.newAddr {
+					voteCount++
+				}
+			}
+
+			if voteCount >= quorumSize && currentState != nil && currentState.addr != event.newAddr {
 				slog.Info("new master elected",
 					"current_master", event.newAddr,
 					"old_master", currentState.addr,
@@ -423,7 +433,7 @@ func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan 
 
 				currentState.cancel()
 
-				masterVotes = make(map[string]map[int]bool)
+				clear(sentinelVotes)
 			}
 		}
 	}
