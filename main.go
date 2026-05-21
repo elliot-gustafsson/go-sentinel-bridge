@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -43,6 +44,49 @@ var (
 		Help: "Current number of active connections to the backend",
 	}, []string{"backend"})
 )
+
+type Sentinel struct {
+	opts   valkey.ClientOption
+	client valkey.Client
+	lock   sync.RWMutex
+}
+
+func NewSentinel(opts valkey.ClientOption) *Sentinel {
+	return &Sentinel{
+		opts: opts,
+	}
+}
+
+func (t *Sentinel) Client() (valkey.Client, error) {
+	t.lock.RLock()
+	if t.client != nil {
+		c := t.client
+		t.lock.RUnlock()
+		return c, nil
+	}
+	t.lock.RUnlock()
+
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.client != nil {
+		return t.client, nil
+	}
+
+	c, err := valkey.NewClient(t.opts)
+	if err != nil {
+		return nil, err
+	}
+
+	t.client = c
+	return t.client, nil
+}
+
+func (t *Sentinel) Close() {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	t.client.Close()
+}
 
 type SwitchMasterEvent struct {
 	sentinelId int
@@ -150,36 +194,52 @@ func main() {
 		os.Exit(1)
 	}
 
-	var sentinels []valkey.Client
-	var expectedSentinels int
+	var sentinels []*Sentinel
+	var connectedSentinels int
 	for s := range strings.SplitSeq(sentinelAddrs, ",") {
 		addr := strings.TrimSpace(s)
 		if addr == "" {
 			continue
 		}
-		expectedSentinels++
 
-		client, err := valkey.NewClient(valkey.ClientOption{InitAddress: []string{addr}})
+		opts, err := valkey.ParseURL(addr)
 		if err != nil {
-			slog.Warn("failed to connect to sentinel", "sentinel_addr", addr, "error", err.Error())
+			var msg string
+			if urlErr, ok := err.(*url.Error); ok {
+				// Dont print full url error, can contain credentials
+				msg = urlErr.Err.Error()
+			} else {
+				msg = err.Error()
+			}
+			slog.Error("error parsing sentinel url", "error", msg)
+			os.Exit(1)
+		}
+
+		sentinel := NewSentinel(opts)
+		sentinels = append(sentinels, sentinel)
+
+		// Init connection to sentinel
+		_, err = sentinel.Client()
+		if err != nil {
+			slog.Warn("failed initial connect to sentinel", "error", err.Error())
 			continue
 		}
-		defer client.Close()
-		sentinels = append(sentinels, client)
+		defer sentinel.Close()
+		connectedSentinels++
 	}
 
-	if expectedSentinels == 0 {
+	if len(sentinels) == 0 {
 		slog.Error("SENTINEL_ADDRS contains no valid endpoints")
 		os.Exit(1)
 	}
 
-	quorumSize := (expectedSentinels / 2) + 1
+	quorumSize := (len(sentinels) / 2) + 1
 
-	if len(sentinels) < quorumSize {
+	if connectedSentinels < quorumSize {
 		slog.Error("not enough sentinels available to reach quorum",
-			"available", len(sentinels),
+			"available", connectedSentinels,
 			"required_quorum", quorumSize,
-			"expected_total", expectedSentinels,
+			"expected_total", len(sentinels),
 		)
 		os.Exit(1)
 	}
@@ -273,7 +333,7 @@ func main() {
 	defer shutdownCtxCancel()
 
 	stopShutdownWatch := context.AfterFunc(shutdownCtx, func() {
-		slog.Warn("connection drain timeout reached, closing active connections...")
+		slog.Warn("connection drain timeout reached, closing active connections...", "timeout_ms", connectionDrainTimeout.Milliseconds())
 		cancel()
 	})
 	defer stopShutdownWatch()
@@ -387,7 +447,7 @@ func handleClientConnection(
 	}
 }
 
-func resolveMasterByQuorum(ctx context.Context, sentinels []valkey.Client, masterName string, quorumSize int) (string, error) {
+func resolveMasterByQuorum(ctx context.Context, sentinels []*Sentinel, masterName string, quorumSize int) (string, error) {
 	for {
 
 		if ctx.Err() != nil {
@@ -426,12 +486,17 @@ func resolveMasterByQuorum(ctx context.Context, sentinels []valkey.Client, maste
 	}
 }
 
-func querySentinelForMaster(ctx context.Context, sentinel valkey.Client, masterName string) (string, error) {
+func querySentinelForMaster(ctx context.Context, sentinel *Sentinel, masterName string) (string, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	cmd := sentinel.B().Arbitrary("SENTINEL", "get-master-addr-by-name", masterName).Build()
-	res, err := sentinel.Do(queryCtx, cmd).AsStrSlice()
+	client, err := sentinel.Client()
+	if err != nil {
+		return "", err
+	}
+
+	cmd := client.B().Arbitrary("SENTINEL", "get-master-addr-by-name", masterName).Build()
+	res, err := client.Do(queryCtx, cmd).AsStrSlice()
 	if err != nil {
 		return "", err
 	}
@@ -484,7 +549,7 @@ func runQuorumCoordinator(ctx context.Context, quorumSize int, eventChan <-chan 
 	}
 }
 
-func runSentinelSubscriber(ctx context.Context, id int, sentinel valkey.Client, masterName string, eventChan chan<- SwitchMasterEvent) {
+func runSentinelSubscriber(ctx context.Context, id int, sentinel *Sentinel, masterName string, eventChan chan<- SwitchMasterEvent) {
 	const defaultBackoff = 100 * time.Millisecond
 	const maxBackoff = 5 * time.Second
 
@@ -492,11 +557,23 @@ func runSentinelSubscriber(ctx context.Context, id int, sentinel valkey.Client, 
 
 	for {
 
-		sub := sentinel.B().Subscribe().Channel("+switch-master").Build()
+		client, err := sentinel.Client()
+		if err != nil {
+			slog.Error("error creating sentinel client", "error", err.Error())
+
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		sub := client.B().Subscribe().Channel("+switch-master").Build()
 
 		startTime := time.Now()
 
-		err := sentinel.Receive(ctx, sub, func(msg valkey.PubSubMessage) {
+		err = client.Receive(ctx, sub, func(msg valkey.PubSubMessage) {
 			if msg.Channel != "+switch-master" {
 				return
 			}
@@ -539,7 +616,7 @@ func runSentinelSubscriber(ctx context.Context, id int, sentinel valkey.Client, 
 
 func runReconciliationLoop(
 	ctx context.Context,
-	sentinels []valkey.Client,
+	sentinels []*Sentinel,
 	masterName string,
 	quorumSize int,
 	eventChan chan<- SwitchMasterEvent,

@@ -17,7 +17,7 @@ The application is configured entirely via environment variables.
 | `PROXY_BIND_ADDR` | The `IP:PORT` the proxy listens on for client TCP traffic. | `0.0.0.0:6379` | `0.0.0.0:6379` |
 | `HTTP_BIND_ADDR` | The `IP:PORT` for the HTTP server (Readiness probes and Metrics). | `0.0.0.0:8080` | `0.0.0.0:8080` |
 | `MASTER_NAME` | The name of the Valkey/Redis master group monitored by Sentinel. | (Required) | `mymaster` |
-| `SENTINEL_ADDRS` | A comma-separated list of Sentinel connection addresses. | (Required) | `10.0.0.1:26379,10.0.0.2:26379` |
+| `SENTINEL_ADDRS` | A comma-separated list of Sentinel connection URLs (supports both `valkey://` and `redis://` prefixes). | (Required) | `valkey://10.0.0.1:26379,valkey://10.0.0.2:26379` |
 | `LOG_LEVEL` | The log level for the application (`debug`, `info`, `warn`, `error`). | `info` | `debug` |
 | `BACKEND_DIAL_TIMEOUT` | The maximum duration the proxy will wait when establishing a new TCP connection to the backend master. | `3s` | `1s` |
 | `TERMINATION_GRACE_PERIOD` | The delay between receiving a shutdown signal and actually refusing new connections. Used to allow load balancers to update routing tables. | `5s` | `10s` |
